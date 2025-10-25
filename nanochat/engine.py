@@ -188,87 +188,106 @@ class Engine:
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        assert isinstance(tokens, list) and (len(tokens) == 0 or isinstance(tokens[0], int)), "expecting list of ints"
         device = self.model.get_device()
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
+        rng = torch.Generator(device=device).manual_seed(seed)
 
-        # Get the special tokens we need to coordinate the tool use state machine
         get_special = lambda s: self.tokenizer.encode_special(s)
-        python_start = get_special("<|python_start|>")
-        python_end = get_special("<|python_end|>")
-        output_start = get_special("<|output_start|>")
-        output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+        python_start   = get_special("<|python_start|>")
+        python_end     = get_special("<|python_end|>")
+        output_start   = get_special("<|output_start|>")
+        output_end     = get_special("<|output_end|>")
+        assistant_end  = get_special("<|assistant_end|>")
+        bos            = self.tokenizer.get_bos_token_id()
 
-        # 1) Run a batch 1 prefill of the prompt tokens
-        m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            **kv_model_kwargs,
-        )
+        tokens = self._flatten_tokens(tokens)
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :]
-        next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-        sampled_tokens = next_ids[:, 0].tolist()
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
+        use_hf = False
+        kv_cache_decode = None
+        past_kv = None
+        sampled_tokens = None
 
-        # 3) Initialize states for each sample
+        # ---------- Try native (Karpathy GPT) prefill ----------
+        native_ok = False
+        try:
+            m = self.model.config
+            kv_model_kwargs = {
+                "num_heads":  getattr(m, "n_kv_head"),
+                "head_dim":   getattr(m, "n_embd") // getattr(m, "n_head"),
+                "num_layers": getattr(m, "n_layer"),
+            }
+            kv_cache_prefill = KVCache(batch_size=1, seq_len=len(tokens), **kv_model_kwargs)
+            outputs = self.model.forward(ids, kv_cache=kv_cache_prefill)
+            # Was the cache actually populated?
+            native_ok = getattr(kv_cache_prefill, "kv_cache", None) is not None
+            if native_ok:
+                logits = _extract_logits(outputs)
+                logits = logits[:, -1, :]
+                next_ids = sample_next_token(logits, rng, temperature, top_k)
+                sampled_tokens = next_ids[:, 0].tolist()
+
+                # Prepare decode cache only for native path
+                kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else getattr(self.model.config, "sequence_len", len(tokens) + 2048)
+                kv_cache_decode = KVCache(batch_size=num_samples, seq_len=kv_length_hint, **kv_model_kwargs)
+                kv_cache_decode.prefill(kv_cache_prefill)
+            # free prefill cache var (whether used or not)
+            del kv_cache_prefill
+        except Exception:
+            native_ok = False  # any error => fall back
+
+        # ---------- HF (Transformers) prefill if native not OK ----------
+        if not native_ok:
+            use_hf = True
+            logits_out = self.model(input_ids=ids, use_cache=True)
+            logits  = _extract_logits(logits_out)
+            logits  = logits[:, -1, :]
+            next_ids = sample_next_token(logits, rng, temperature, top_k)
+            sampled_tokens = next_ids[:, 0].tolist()
+            past_kv = getattr(logits_out, "past_key_values", None)
+
+        # 3) Initialize states
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
         # 4) Main generation loop
         num_generated = 0
         first_iteration = True
         while True:
-            # Stop condition: we've reached max tokens
             if max_tokens is not None and num_generated >= max_tokens:
                 break
-            # Stop condition: all rows are completed
             if all(state.completed for state in row_states):
                 break
 
-            # Get sampled tokens - either from prefill or from forward pass
             if first_iteration:
-                # Use the tokens we already sampled from prefill
-                sampled_tokens = [sampled_tokens[0]] * num_samples  # Broadcast first token to all rows
-                # TODO: we should sample a token for each row instead of broadcasting
+                sampled_tokens = [sampled_tokens[0]] * num_samples
                 first_iteration = False
             else:
-                # Forward the model and get the next token for each row
-                logits = self.model.forward(ids, kv_cache=kv_cache_decode)  # (B, T, vocab_size)
-                logits = logits[:, -1, :]  # (B, vocab_size) at last time step
-                next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-                sampled_tokens = next_ids[:, 0].tolist()
+                if use_hf:
+                    logits_out = self.model(
+                        input_ids=ids,
+                        past_key_values=past_kv,
+                        use_cache=True,
+                    )
+                    logits = _extract_logits(logits_out)
+                    logits = logits[:, -1, :]
+                    next_ids = sample_next_token(logits, rng, temperature, top_k)
+                    sampled_tokens = next_ids[:, 0].tolist()
+                    past_kv = getattr(logits_out, "past_key_values", past_kv)
+                else:
+                    logits = self.model.forward(ids, kv_cache=kv_cache_decode)
+                    logits = logits[:, -1, :]
+                    next_ids = sample_next_token(logits, rng, temperature, top_k)
+                    sampled_tokens = next_ids[:, 0].tolist()
 
-            # Process each row: choose the next token, update state, optional tool use
-            token_column = [] # contains the next token id along each row
-            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
+            token_column, token_masks = [], []
             for i, state in enumerate(row_states):
-                # Select the next token in this row
-                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
-                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                is_forced = len(state.forced_tokens) > 0
+                token_masks.append(0 if is_forced else 1)
                 next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
                 token_column.append(next_token)
-                # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
-                # On <|assistant_end|> or <|bos|>, mark the row as completed
                 if next_token == assistant_end or next_token == bos:
                     state.completed = True
-                # Handle tool logic
                 if next_token == python_start:
                     state.in_python_block = True
                     state.python_expr_tokens = []
@@ -286,11 +305,21 @@ class Engine:
                 elif state.in_python_block:
                     state.python_expr_tokens.append(next_token)
 
-            # Yield the token column
             yield token_column, token_masks
             num_generated += 1
-            # Prepare ids for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+
+    # tokens may contain nested lists (e.g., special token wrappers) — flatten & coerce to ints
+    def _flatten_tokens(self, seq):
+        flat = []
+        for x in seq:
+            if isinstance(x, (list, tuple)):
+                flat.extend(int(y) for y in x)
+            else:
+                flat.append(int(x))
+        return flat
+
+
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """
@@ -367,3 +396,21 @@ if __name__ == "__main__":
             print(f"Mismatch at {i}: {reference_ids[i]} != {generated_tokens[i]}")
             break
     print(f"Match: {reference_ids == generated_tokens}")
+
+
+from typing import Any
+
+def _extract_logits(outputs: Any):
+    
+    #Accept HF ModelOutput / tuple / tensor and return a tensor of logits.
+    
+    import torch as _torch
+    logits = getattr(outputs, "logits", None)
+    if logits is None:
+        if isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+            logits = outputs[0]
+        else:
+            logits = outputs
+    if not isinstance(logits, _torch.Tensor):
+        raise TypeError(f"Expected tensor logits, got {type(logits)}")
+    return logits

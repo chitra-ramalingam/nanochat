@@ -12,6 +12,8 @@ from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
 
 # Set up logging
 setup_default_logging()
@@ -116,6 +118,96 @@ def find_last_step(checkpoint_dir):
     last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
     return last_step
 
+
+SPECIAL_TOKENS = [
+    "<|user_start|>", "<|user_end|>",
+    "<|assistant_start|>", "<|assistant_end|>",
+    "<|system_start|>", "<|system_end|>",
+]
+
+def _adapt_tokenizer(tok):
+    # Add NanoChat-style helpers that the code expects
+    if not hasattr(tok, "get_bos_token_id"):
+        setattr(tok, "get_bos_token_id", lambda: getattr(tok, "bos_token_id", None))
+    if not hasattr(tok, "get_eos_token_id"):
+        setattr(tok, "get_eos_token_id", lambda: getattr(tok, "eos_token_id", None))
+    if not hasattr(tok, "get_vocab_size"):
+        if hasattr(tok, "vocab_size"):
+            setattr(tok, "get_vocab_size", lambda: tok.vocab_size)
+        else:
+            setattr(tok, "get_vocab_size", lambda: None)
+    if not hasattr(tok, "encode_special"):
+        setattr(tok, "encode_special", lambda s: [tok.convert_tokens_to_ids(s)])
+    return tok
+
+
+def load_model_from_hf(repo_id: str, device, phase="eval", dtype: str | None = None, **kwargs):
+    if dtype == "bfloat16": torch_dtype = torch.bfloat16
+    elif dtype == "float32": torch_dtype = torch.float32
+    else:
+        torch_dtype = torch.float16 if device.type == "cuda" else (torch.bfloat16 if device.type == "mps" else torch.float32)
+
+    tok = AutoTokenizer.from_pretrained(repo_id, use_fast=True)
+
+    to_add = [t for t in SPECIAL_TOKENS if tok.convert_tokens_to_ids(t) in (None, tok.unk_token_id, -1)]
+    if to_add:
+        tok.add_special_tokens({"additional_special_tokens": to_add})
+
+    model = AutoModelForCausalLM.from_pretrained(
+        repo_id,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        device_map="auto" if device.type in ("cuda", "mps") else None
+    )
+
+    # ---- HF config -> NanoChat config shim --------------------------------
+    cfg = model.config
+    if not hasattr(cfg, "n_head") and hasattr(cfg, "num_attention_heads"):
+        cfg.n_head = cfg.num_attention_heads
+    if not hasattr(cfg, "n_kv_head"):
+        if hasattr(cfg, "num_key_value_heads") and cfg.num_key_value_heads is not None:
+            cfg.n_kv_head = cfg.num_key_value_heads
+        else:
+            cfg.n_kv_head = getattr(cfg, "num_attention_heads", None)  # non-GQA fallback
+    if not hasattr(cfg, "n_embd") and hasattr(cfg, "hidden_size"):
+        cfg.n_embd = cfg.hidden_size
+    if not hasattr(cfg, "n_layer") and hasattr(cfg, "num_hidden_layers"):
+        cfg.n_layer = cfg.num_hidden_layers
+    # -----------------------------------------------------------------------
+
+    # --- Adapters so Nanochat's engine works with HF models ----------------
+    if not hasattr(model, "get_device"):
+        def _get_device():
+            try:
+                return next(model.parameters()).device
+            except StopIteration:
+                return torch.device("cpu")
+        setattr(model, "get_device", _get_device)
+
+    if not hasattr(model, "max_seq_len"):
+        max_len = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+        if max_len is None:
+            try:
+                max_len = tok.model_max_length
+                if isinstance(max_len, int) and max_len > 32768:
+                    max_len = 4096
+            except Exception:
+                max_len = 4096
+        setattr(model, "max_seq_len", max_len)
+    # -----------------------------------------------------------------------
+
+    if to_add:
+        model.resize_token_embeddings(len(tok))
+
+    if device.type == "cpu":
+        model.to(device)
+    model.eval() if phase == "eval" else model.train()
+
+    tok = _adapt_tokenizer(tok)
+
+    meta = {"source": "hf", "repo_id": repo_id, "model_config": {"vocab_size": tok.get_vocab_size()}}
+    return model, tok, meta
+
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
@@ -134,13 +226,23 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
     return model, tokenizer, meta_data
 
-def load_model(source, *args, **kwargs):
-    model_dir = {
-        "base": "base_checkpoints",
-        "mid": "mid_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
-    return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+def load_model(source, device, phase="eval", model_tag=None, step=None):
+    source = (source or "").lower()
+    if source in {"base", "mid", "sft", "rl"}:
+        model_dir = {
+            "base": "base_checkpoints",
+            "mid":  "mid_checkpoints",
+            "sft":  "chatsft_checkpoints",
+            "rl":   "chatrl_checkpoints",
+        }[source]
+        base_dir = get_base_dir()
+        checkpoints_dir = os.path.join(base_dir, model_dir)
+        return load_model_from_dir(checkpoints_dir, device, phase, model_tag=model_tag, step=step)
+
+    elif source == "hf":
+        if not model_tag:
+            raise ValueError("When source='hf', pass -g/--model-tag as an HF repo id (e.g. microsoft/phi-3-mini-4k-instruct)")
+        return load_model_from_hf(model_tag, device, phase=phase)
+
+    else:
+        raise KeyError(source)

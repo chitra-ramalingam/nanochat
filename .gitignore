@@ -5,3 +5,7 @@ rustbpe/target/
 dev-ignore/
 report.md
 eval_bundle/
+nanochat.egg-info/PKG-INFO
+nanochat.egg-info/requires.txt
+nanochat.egg-info/SOURCES.txt
+nanochat.egg-info/top_level.txt

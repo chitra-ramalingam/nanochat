@@ -1,3 +1,34 @@
+# this fork changes 
+What’s different in this fork (Windows + Hugging Face support)
+
+This fork adds an optional Hugging Face (“hf”) load path and a few Windows QoL fixes. Default NanoChat load paths (base | mid | sft | rl) still work unchanged.
+
+Highlights
+
+New source: huggingface → load any  Transformers model by repo id (no NanoChat checkpoints needed).
+
+Tokenizer adapter (only for HF): adds encode_special(), get_bos_token_id(), get_eos_token_id(), get_vocab_size()
+Changes on 
+engine.py
+checkpoint.py 
+and common.py (for locks)
+
+
+----------------
+Prereqs (Windows 10/11):
+
+Python 3.12 (x64), Git, Rust (rustup), Visual Studio Build Tools with Desktop development with C++ + Windows SDK 10 or 11.
+
+git clone  this fork
+cd nanochat
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -U pip setuptools wheel
+pip install transformers "huggingface_hub>=0.23" safetensors accelerate fastapi uvicorn tiktoken tokenizers
+
+python scripts/chat_web.py -i hf -g microsoft/phi-3-mini-4k-instruct --device-type cpu --host 127.0.0.1 -p 8000
+# this fork ends
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)

@@ -5,7 +5,7 @@ Common utilities for nanochat.
 import os
 import re
 import logging
-import fcntl
+#import fcntl
 import urllib.request
 import torch
 import torch.distributed as dist
@@ -57,11 +57,36 @@ def get_base_dir():
         nanochat_dir = os.path.join(cache_dir, "nanochat")
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
+# --- Cross-platform file lock (no fcntl needed) ------------------------------
+# We lock by creating a separate ".lock" file atomically. If it exists, wait.
+
+def _acquire_lock(lock_path: str, poll: float = 0.2):
+    """Acquire an exclusive lock by atomically creating lock_path."""
+    while True:
+        try:
+            # O_CREAT|O_EXCL ensures exclusive creation or raises FileExistsError
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            return fd  # keep fd open to hold the lock
+        except FileExistsError:
+            time.sleep(poll)
+
+def _release_lock(fd: int, lock_path: str):
+    """Release the lock by closing and deleting the lock file."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
+# ----------------------------------------------------------------------------- 
+
 
 def download_file_with_lock(url, filename):
     """
     Downloads a file from a URL to a local path in the base directory.
-    Uses a lock file to prevent concurrent downloads among multiple ranks.
+    Uses a cross-platform lock file (atomic create) to prevent concurrent downloads.
     """
     base_dir = get_base_dir()
     file_path = os.path.join(base_dir, filename)
@@ -70,12 +95,8 @@ def download_file_with_lock(url, filename):
     if os.path.exists(file_path):
         return file_path
 
-    with open(lock_path, 'w') as lock_file:
-
-        # Only a single rank can acquire this lock
-        # All other ranks block until it is released
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
+    fd = _acquire_lock(lock_path)  # blocks until exclusive lock acquired
+    try:
         if os.path.exists(file_path):
             return file_path
 
@@ -83,18 +104,14 @@ def download_file_with_lock(url, filename):
         with urllib.request.urlopen(url) as response:
             content = response.read().decode('utf-8')
 
-        with open(file_path, 'w') as f:
+        with open(file_path, 'w', encoding='utf-8') as f:
             f.write(content)
 
         print(f"Downloaded to {file_path}")
+        return file_path
+    finally:
+        _release_lock(fd, lock_path)
 
-    # Clean up the lock file after the lock is released
-    try:
-        os.remove(lock_path)
-    except OSError:
-        pass  # Ignore if already removed by another process
-
-    return file_path
 
 def print0(s="",**kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
